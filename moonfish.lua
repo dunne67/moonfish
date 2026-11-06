@@ -14,7 +14,29 @@ local str_char = string.char
 local str_sub = string.sub
 local str_find = string.find
 local str_format = string.format
+-- Wall-clock timer. os.clock() measures CPU time on POSIX systems, so under
+-- LuaJIT we use the OS monotonic clock via FFI; plain Lua 5.1 falls back to os.clock.
 local clock = os.clock
+do
+    local ok_ffi, ffi = pcall(require, "ffi")
+    if ok_ffi and ffi then
+        local ok = pcall(function()
+            if ffi.os == "Windows" then
+                ffi.cdef("int QueryPerformanceCounter(int64_t *c); int QueryPerformanceFrequency(int64_t *f);")
+                local c, f = ffi.new("int64_t[1]"), ffi.new("int64_t[1]")
+                ffi.C.QueryPerformanceFrequency(f)
+                local freq = tonumber(f[0])
+                clock = function() ffi.C.QueryPerformanceCounter(c); return tonumber(c[0]) / freq end
+            else
+                ffi.cdef("typedef struct { long tv_sec; long tv_nsec; } mf_timespec; int clock_gettime(int id, mf_timespec *ts);")
+                local ts = ffi.new("mf_timespec")
+                clock = function() ffi.C.clock_gettime(1, ts); return tonumber(ts.tv_sec) + tonumber(ts.tv_nsec) * 1e-9 end
+            end
+            clock()
+        end)
+        if not ok then clock = os.clock end
+    end
+end
 
 -- ----------------------------------------------------------------------------
 -- Bitwise XOR Support (LuaJIT native bitlib with PUC Lua 5.1 byte-table fallback)
@@ -400,8 +422,8 @@ local piece_counts = {}
 for p = 1, 12 do piece_counts[p] = 0 end
 
 -- History of root game for 3-fold repetition
-local game_history_keys = {}
-local game_history_len = 0
+local rep_keys = {}
+local rep_len = 0
 
 -- Undo Stack
 local MAX_PLY = 128
@@ -430,7 +452,7 @@ for i = 0, MAX_PLY do
 end
 
 -- Move Generation Stack
-local MAX_MOVES = 8192
+local MAX_MOVES = 256 * (128 + 2)
 local move_stack  = {}
 local score_stack = {}
 local move_head   = {}
@@ -517,7 +539,7 @@ local function reset_board()
     eg_score[WHITE] = 0
     eg_score[BLACK] = 0
     game_phase = 0
-    game_history_len = 0
+    rep_len = 0
 end
 
 local function compute_full_eval_and_key()
@@ -593,8 +615,8 @@ local function load_fen(fen)
     fullmove = tonumber(parts[6]) or 1
 
     compute_full_eval_and_key()
-    game_history_len = 1
-    game_history_keys[1] = zobrist_key
+    rep_len = 1
+    rep_keys[1] = zobrist_key
 end
 
 local function print_board()
@@ -701,7 +723,9 @@ local function generate_moves(ply, captures_only)
 
                 -- Single Push
                 local dest = sq + NORTH
-                if board[dest] == EMPTY and not captures_only then
+                if captures_only and rank == 7 and board[dest] == EMPTY then
+                    move_stack[count] = pack_move(sq, dest, W_QUEEN, FLAG_NORMAL); count = count + 1
+                elseif board[dest] == EMPTY and not captures_only then
                     if rank == 7 then
                         move_stack[count] = pack_move(sq, dest, W_QUEEN,  FLAG_NORMAL); count = count + 1
                         move_stack[count] = pack_move(sq, dest, W_ROOK,   FLAG_NORMAL); count = count + 1
@@ -759,7 +783,9 @@ local function generate_moves(ply, captures_only)
 
                 -- Single Push
                 local dest = sq + SOUTH
-                if board[dest] == EMPTY and not captures_only then
+                if captures_only and rank == 2 and board[dest] == EMPTY then
+                    move_stack[count] = pack_move(sq, dest, W_QUEEN, FLAG_NORMAL); count = count + 1
+                elseif board[dest] == EMPTY and not captures_only then
                     if rank == 2 then
                         move_stack[count] = pack_move(sq, dest, W_QUEEN,  FLAG_NORMAL); count = count + 1
                         move_stack[count] = pack_move(sq, dest, W_ROOK,   FLAG_NORMAL); count = count + 1
@@ -1174,6 +1200,8 @@ end
 local function make_null_move(ply)
     undo_ep[ply]       = ep_sq
     undo_key[ply]      = zobrist_key
+    undo_halfmove[ply] = halfmove
+    halfmove = 0 -- a null move must not create repetitions with positions before it
 
     zobrist_key = bxor(zobrist_key, ZOBRIST_EP[ep_sq ~= 0 and (ep_sq % 10) or 0])
     ep_sq = 0
@@ -1187,6 +1215,7 @@ local function unmake_null_move(ply)
     side = 1 - side
     ep_sq = undo_ep[ply]
     zobrist_key = undo_key[ply]
+    halfmove = undo_halfmove[ply]
 end
 
 -- Has non-pawn material (to avoid zugzwang when null-move pruning)
@@ -1250,6 +1279,11 @@ end
 -- ----------------------------------------------------------------------------
 local INFINITY   = 1000000
 local MATE_SCORE = 100000
+local MAX_SEARCH_PLY = 120                 -- hard ply cap (stacks hold MAX_PLY = 128)
+local MATE_BOUND = MATE_SCORE - 2 * MAX_SEARCH_PLY
+
+-- Optional hook polled during search so a UCI "stop" can interrupt the search.
+local stop_poll = nil
 
 local nodes_searched = 0
 local search_start_time = 0
@@ -1257,23 +1291,26 @@ local search_stop_time = 0
 local stop_search = false
 
 local function check_time()
-    if clock() >= search_stop_time then
+    if clock() >= search_stop_time or (stop_poll and stop_poll()) then
         stop_search = true
     end
 end
 
--- Repetition & 50-move check
+-- Repetition & 50-move check.
+-- Positions repeat only with the same side to move, so we step back two plies
+-- at a time, and never past the last irreversible move (halfmove reset).
+-- Inside the search a single repetition is scored as a draw (standard practice);
+-- positions are tracked in a flat key stack covering game history + search path.
+
 local function is_repetition_or_50move(ply)
     if halfmove >= 100 then return true end
-    -- Check search stack
-    if ply > 0 then
-        for i = 0, ply - 1 do
-            if undo_key[i] == zobrist_key then return true end
-        end
-    end
-    -- Check game history
-    for i = 1, game_history_len - 1 do
-        if game_history_keys[i] == zobrist_key then return true end
+    local top = rep_len + ply          -- index of the current position
+    local limit = top - halfmove
+    if limit < 1 then limit = 1 end
+    local i = top - 2
+    while i >= limit do
+        if rep_keys[i] == zobrist_key then return true end
+        i = i - 2
     end
     return false
 end
@@ -1285,12 +1322,12 @@ local function quiesce(alpha, beta, ply)
     if stop_search then return 0 end
 
     local stand_pat = evaluate()
+    if ply >= MAX_SEARCH_PLY then return stand_pat end
     if stand_pat >= beta then return beta end
     if stand_pat > alpha then alpha = stand_pat end
 
-    -- Delta Pruning
-    local BIGGEST_DELTA = 950
-    if stand_pat < alpha - BIGGEST_DELTA then
+    -- Delta Pruning: even winning a queen cannot raise alpha
+    if stand_pat < alpha - 1100 then
         return alpha
     end
 
@@ -1301,7 +1338,6 @@ local function quiesce(alpha, beta, ply)
     local tail = move_head[ply + 1] - 1
 
     for i = head, tail do
-        -- Selection sort: best score first
         local best_idx = i
         local best_sc = score_stack[i]
         for j = i + 1, tail do
@@ -1329,22 +1365,32 @@ local function quiesce(alpha, beta, ply)
     return alpha
 end
 
+local root_best_move = 0
+
 -- Negamax Alpha-Beta with Transposition Table, NMP, and LMR
 local function negamax(alpha, beta, depth, ply, can_null)
     if (nodes_searched % 2048 == 0) then check_time() end
     if stop_search then return 0 end
 
-    -- Repetition & 50-move rule
-    if ply > 0 and is_repetition_or_50move(ply) then
-        return 0
+    rep_keys[rep_len + ply] = zobrist_key
+
+    if ply > 0 then
+        if is_repetition_or_50move(ply) then return 0 end
+        -- Mate distance pruning
+        local mate_alpha = -MATE_SCORE + ply
+        local mate_beta  = MATE_SCORE - ply - 1
+        if alpha < mate_alpha then alpha = mate_alpha end
+        if beta > mate_beta then beta = mate_beta end
+        if alpha >= beta then return alpha end
     end
+
+    if ply >= MAX_SEARCH_PLY then return evaluate() end
 
     local in_chk = in_check(side)
 
-    -- Check Extension
-    if in_chk then depth = depth + 1 end
+    -- Check Extension (bounded so the search depth cannot run away)
+    if in_chk and ply < MAX_SEARCH_PLY - 8 then depth = depth + 1 end
 
-    -- Leaf: Drop to Quiescence Search
     if depth <= 0 then
         return quiesce(alpha, beta, ply)
     end
@@ -1353,42 +1399,44 @@ local function negamax(alpha, beta, depth, ply, can_null)
 
     -- Transposition Table Probe
     local tt_idx = (zobrist_key % TT_SIZE) + 1
-    local tt_hit = (tt_key[tt_idx] == zobrist_key)
     local tt_suggested_move = 0
 
-    if tt_hit then
+    if tt_key[tt_idx] == zobrist_key then
         tt_suggested_move = tt_move[tt_idx]
         if ply > 0 and tt_depth[tt_idx] >= depth then
             local t_score = tt_score[tt_idx]
-            if t_score > MATE_SCORE - 100 then t_score = t_score - ply
-            elseif t_score < -MATE_SCORE + 100 then t_score = t_score + ply end
+            if t_score > MATE_BOUND then t_score = t_score - ply
+            elseif t_score < -MATE_BOUND then t_score = t_score + ply end
 
             local t_flag = tt_flag[tt_idx]
             if t_flag == TT_EXACT then
                 return t_score
             elseif t_flag == TT_LOWER and t_score >= beta then
-                return beta
+                return t_score
             elseif t_flag == TT_UPPER and t_score <= alpha then
-                return alpha
+                return t_score
             end
         end
     end
 
     -- Null Move Pruning (NMP)
-    if can_null and not in_chk and depth >= 3 and ply > 0 and has_non_pawn_material(side) then
+    if can_null and not in_chk and depth >= 3 and ply > 0 and beta < MATE_BOUND
+       and has_non_pawn_material(side) and evaluate() >= beta then
+        -- No moves were generated at this ply yet: give the child a fresh
+        -- stack region so it cannot overwrite the parent's move list.
+        move_head[ply + 1] = move_head[ply]
         make_null_move(ply)
-        local r = 2
-        if depth >= 6 then r = 3 end
+        local r = (depth >= 6) and 3 or 2
         local null_score = -negamax(-beta, -beta + 1, depth - 1 - r, ply + 1, false)
         unmake_null_move(ply)
 
         if stop_search then return 0 end
         if null_score >= beta then
-            return beta
+            if null_score >= MATE_BOUND then null_score = beta end
+            return null_score
         end
     end
 
-    -- Move Generation & Ordering
     generate_moves(ply, false)
     score_moves(ply, tt_suggested_move)
 
@@ -1401,7 +1449,6 @@ local function negamax(alpha, beta, depth, ply, can_null)
     local original_alpha = alpha
 
     for i = head, tail do
-        -- In-place selection sort
         local best_idx = i
         local best_sc = score_stack[i]
         for j = i + 1, tail do
@@ -1416,20 +1463,32 @@ local function negamax(alpha, beta, depth, ply, can_null)
         end
 
         local m = move_stack[i]
+        local to_sq = move_to(m)
+        -- Classify BEFORE making the move: afterwards the destination holds our own piece.
+        local is_quiet = board[to_sq] == EMPTY and move_promo(m) == 0 and move_flag(m) ~= FLAG_EP
+        local mover = board[move_from(m)]
+
         if make_move(m, ply) then
             legal_moves = legal_moves + 1
             local score
 
-            -- Late Move Reductions (LMR)
-            if legal_moves > 4 and depth >= 3 and not in_chk and board[move_to(m)] == EMPTY and move_promo(m) == 0 then
-                local reduction = (legal_moves > 8 and depth > 5) and 2 or 1
+            if legal_moves == 1 then
+                score = -negamax(-beta, -alpha, depth - 1, ply + 1, true)
+            else
+                -- Late Move Reductions for late quiet moves that do not give check
+                local reduction = 0
+                if legal_moves > 3 and depth >= 3 and is_quiet and not in_chk and not in_check(side) then
+                    reduction = 1
+                    if legal_moves > 8 and depth >= 6 then reduction = 2 end
+                end
+                -- Principal Variation Search: null-window probe, re-search on fail-high
                 score = -negamax(-alpha - 1, -alpha, depth - 1 - reduction, ply + 1, true)
-                if score > alpha then
-                    -- Re-search at full depth
+                if score > alpha and reduction > 0 then
+                    score = -negamax(-alpha - 1, -alpha, depth - 1, ply + 1, true)
+                end
+                if score > alpha and score < beta then
                     score = -negamax(-beta, -alpha, depth - 1, ply + 1, true)
                 end
-            else
-                score = -negamax(-beta, -alpha, depth - 1, ply + 1, true)
             end
 
             unmake_move(m, ply)
@@ -1438,18 +1497,29 @@ local function negamax(alpha, beta, depth, ply, can_null)
             if score > best_score then
                 best_score = score
                 best_move = m
+                if ply == 0 then root_best_move = m end
             end
 
             if score > alpha then
                 alpha = score
                 if alpha >= beta then
-                    -- Beta Cutoff (Fail-High)
-                    -- Update Killer & History heuristics for quiet moves
-                    if board[move_to(m)] == EMPTY and move_promo(m) == 0 then
-                        killer_moves[ply][2] = killer_moves[ply][1]
-                        killer_moves[ply][1] = m
-                        local p = board[move_from(m)]
-                        history_heuristic[p][move_to(m)] = (history_heuristic[p][move_to(m)] or 0) + depth * depth
+                    if is_quiet then
+                        local k = killer_moves[ply]
+                        if k[1] ~= m then
+                            k[2] = k[1]
+                            k[1] = m
+                        end
+                        local h = history_heuristic[mover]
+                        local v = h[to_sq] + depth * depth
+                        if v > 400000 then
+                            -- Age the whole table so history never outranks killers
+                            for p = 1, 12 do
+                                local hp = history_heuristic[p]
+                                for sq = 21, 98 do hp[sq] = floor(hp[sq] / 2) end
+                            end
+                            v = floor(v / 2)
+                        end
+                        h[to_sq] = v
                     end
                     break
                 end
@@ -1457,16 +1527,11 @@ local function negamax(alpha, beta, depth, ply, can_null)
         end
     end
 
-    -- Terminal state check (Checkmate or Stalemate)
     if legal_moves == 0 then
-        if in_chk then
-            return -MATE_SCORE + ply -- Checkmate
-        else
-            return 0 -- Stalemate
-        end
+        if in_chk then return -MATE_SCORE + ply end
+        return 0
     end
 
-    -- Store in Transposition Table
     local flag = TT_EXACT
     if best_score <= original_alpha then
         flag = TT_UPPER
@@ -1475,8 +1540,8 @@ local function negamax(alpha, beta, depth, ply, can_null)
     end
 
     local store_score = best_score
-    if store_score > MATE_SCORE - 100 then store_score = store_score + ply
-    elseif store_score < -MATE_SCORE + 100 then store_score = store_score - ply end
+    if store_score > MATE_BOUND then store_score = store_score + ply
+    elseif store_score < -MATE_BOUND then store_score = store_score - ply end
 
     tt_key[tt_idx]   = zobrist_key
     tt_depth[tt_idx] = depth
@@ -1487,58 +1552,67 @@ local function negamax(alpha, beta, depth, ply, can_null)
     return best_score
 end
 
--- Iterative Deepening Search Root
-local function search_position(max_depth, time_limit_ms)
+
+local function format_score(score)
+    if abs(score) > MATE_BOUND then
+        local mate_plies = MATE_SCORE - abs(score)
+        local mate_moves = floor((mate_plies + 1) / 2)
+        if score < 0 then mate_moves = -mate_moves end
+        return "score mate " .. mate_moves
+    end
+    return "score cp " .. score
+end
+
+-- Iterative Deepening Search Root.
+-- time_limit_ms: hard limit (nil = no limit). soft_ms: do not start a new
+-- iteration after this much time (defaults to half the hard limit).
+local function search_position(max_depth, time_limit_ms, soft_ms, no_bestmove, silent)
     nodes_searched = 0
     search_start_time = clock()
     search_stop_time = (time_limit_ms and time_limit_ms > 0)
         and (search_start_time + time_limit_ms / 1000)
-        or (search_start_time + 1000000)
+        or math.huge
     stop_search = false
+
+    max_depth = max_depth or 64
+    if max_depth > MAX_SEARCH_PLY - 1 then max_depth = MAX_SEARCH_PLY - 1 end
+    if not soft_ms and time_limit_ms then soft_ms = time_limit_ms * 0.5 end
 
     local best_move = 0
     local best_score = 0
     clear_heuristics()
 
-    for current_depth = 1, (max_depth or 64) do
+    for current_depth = 1, max_depth do
+        root_best_move = 0
         local score = negamax(-INFINITY, INFINITY, current_depth, 0, true)
 
-        if stop_search then break end
+        -- A partial iteration still yields a usable move if one was improved on.
+        if stop_search then
+            if root_best_move ~= 0 and current_depth > 1 then best_move = root_best_move end
+            break
+        end
 
-        local tt_idx = (zobrist_key % TT_SIZE) + 1
-        if tt_key[tt_idx] == zobrist_key and tt_move[tt_idx] ~= 0 then
-            best_move = tt_move[tt_idx]
+        if root_best_move ~= 0 then
+            best_move = root_best_move
             best_score = score
         end
 
         local elapsed = clock() - search_start_time
         local nps = floor(nodes_searched / (elapsed > 0 and elapsed or 0.001))
 
-        -- Format UCI info output
-        local score_str
-        if abs(best_score) > MATE_SCORE - 100 then
-            local mate_plies = MATE_SCORE - abs(best_score)
-            local mate_moves = floor((mate_plies + 1) / 2)
-            if best_score < 0 then mate_moves = -mate_moves end
-            score_str = "score mate " .. mate_moves
-        else
-            score_str = "score cp " .. best_score
+        if not silent then
+            print(str_format("info depth %d %s nodes %d nps %d time %d pv %s",
+                current_depth, format_score(best_score), nodes_searched, nps,
+                floor(elapsed * 1000), move_to_uci(best_move)))
+            io.flush()
         end
 
-        print(str_format("info depth %d %s nodes %d nps %d time %d pv %s",
-            current_depth, score_str, nodes_searched, nps, floor(elapsed * 1000), move_to_uci(best_move)))
-
-        -- Early stop if checkmate found
-        if abs(best_score) > MATE_SCORE - 100 then break end
-
-        -- If over 50% of time limit elapsed, don't start next depth
-        if time_limit_ms and elapsed >= (time_limit_ms / 1000) * 0.5 then
-            break
-        end
+        if abs(best_score) > MATE_BOUND and current_depth >= (MATE_SCORE - abs(best_score)) then break end
+        if soft_ms and elapsed * 1000 >= soft_ms then break end
+        if stop_poll and stop_poll() then break end
     end
 
     if best_move == 0 then
-        -- Fallback: pick first legal move
         generate_moves(0, false)
         for i = move_head[0], move_head[1] - 1 do
             local m = move_stack[i]
@@ -1550,8 +1624,11 @@ local function search_position(max_depth, time_limit_ms)
         end
     end
 
-    print("bestmove " .. move_to_uci(best_move))
-    return best_move
+    if not no_bestmove then
+        print("bestmove " .. move_to_uci(best_move))
+        io.flush()
+    end
+    return best_move, best_score
 end
 
 -- ----------------------------------------------------------------------------
@@ -1633,12 +1710,79 @@ local function parse_move(str)
     return nil
 end
 
+-- Non-blocking stdin check, so "stop"/"quit" can interrupt a running search.
+-- Requires LuaJIT's FFI; plain Lua 5.1 has no portable way to poll stdin, so
+-- there the search can only end on its own limits (depth/time).
+local input_available = nil
+do
+    local ok_ffi, ffi = pcall(require, "ffi")
+    if ok_ffi and ffi then
+        pcall(function()
+            if ffi.os == "Windows" then
+                ffi.cdef([[
+                    void* GetStdHandle(unsigned long n);
+                    int PeekNamedPipe(void* h, void* buf, unsigned long sz, void* read,
+                                      unsigned long* avail, void* left);
+                ]])
+                local h = ffi.C.GetStdHandle(4294967286) -- STD_INPUT_HANDLE (-10)
+                local avail = ffi.new("unsigned long[1]")
+                if ffi.C.PeekNamedPipe(h, nil, 0, nil, avail, nil) ~= 0 then
+                    input_available = function()
+                        if ffi.C.PeekNamedPipe(h, nil, 0, nil, avail, nil) == 0 then return true end -- pipe closed
+                        return avail[0] > 0
+                    end
+                end
+            else
+                ffi.cdef([[
+                    struct mf_pollfd { int fd; short events; short revents; };
+                    int poll(struct mf_pollfd *fds, unsigned long nfds, int timeout);
+                ]])
+                local pfd = ffi.new("struct mf_pollfd[1]")
+                pfd[0].fd = 0
+                pfd[0].events = 1 -- POLLIN
+                input_available = function()
+                    return ffi.C.poll(pfd, 1, 0) > 0
+                end
+            end
+        end)
+    end
+end
+
+local pending_lines = {}
+local quit_requested = false
+
+local function read_line()
+    if #pending_lines > 0 then return table.remove(pending_lines, 1) end
+    return io.read("*line")
+end
+
+-- Called periodically from the search. Answers isready immediately, stops on
+-- stop/quit, and queues anything else for after the search.
+local poll_counter = 0
+local function poll_input()
+    poll_counter = poll_counter + 1
+    if poll_counter % 8 ~= 0 then return false end
+    while input_available() do
+        local line = io.read("*line")
+        if not line then quit_requested = true; return true end
+        local cmd = line:match("^%s*(%S+)")
+        if cmd == "stop" then return true
+        elseif cmd == "quit" then quit_requested = true; return true
+        elseif cmd == "isready" then print("readyok"); io.flush()
+        elseif cmd then pending_lines[#pending_lines + 1] = line
+        end
+    end
+    return false
+end
+
 local function uci_loop()
     reset_board()
     load_fen(START_FEN)
+    -- Unbuffered stdin: buffered reads could swallow a "stop" before we poll for it.
+    if io.stdin.setvbuf then pcall(io.stdin.setvbuf, io.stdin, "no") end
 
-    while true do
-        local line = io.read("*line")
+    while not quit_requested do
+        local line = read_line()
         if not line then break end
 
         local tokens = {}
@@ -1649,7 +1793,7 @@ local function uci_loop()
         local cmd = tokens[1]
         if cmd == "uci" then
             print("id name Moonfish 1.0")
-            print("id author Moonfish Team")
+            print("id author dunne67")
             print("uciok")
 
         elseif cmd == "isready" then
@@ -1680,11 +1824,12 @@ local function uci_loop()
                 idx = idx + 1
                 while idx <= #tokens do
                     local m = parse_move(tokens[idx])
-                    if m then
-                        make_move(m, 0)
-                        game_history_len = game_history_len + 1
-                        game_history_keys[game_history_len] = zobrist_key
+                    if not m or not make_move(m, 0) then
+                        print("info string illegal move " .. tokens[idx] .. ", ignoring remaining moves")
+                        break
                     end
+                    rep_len = rep_len + 1
+                    rep_keys[rep_len] = zobrist_key
                     idx = idx + 1
                 end
             end
@@ -1692,11 +1837,16 @@ local function uci_loop()
         elseif cmd == "go" then
             local depth = 64
             local movetime = nil
-            local wtime, btime, winc, binc
+            local wtime, btime, winc, binc, movestogo
+            local infinite = false
 
             local i = 2
             while i <= #tokens do
-                if tokens[i] == "depth" then
+                if tokens[i] == "infinite" or tokens[i] == "ponder" then
+                    infinite = true; i = i + 1
+                elseif tokens[i] == "movestogo" then
+                    movestogo = tonumber(tokens[i + 1]); i = i + 2
+                elseif tokens[i] == "depth" then
                     depth = tonumber(tokens[i + 1])
                     i = i + 2
                 elseif tokens[i] == "movetime" then
@@ -1715,19 +1865,33 @@ local function uci_loop()
                 end
             end
 
-            local time_for_move
-            if movetime then
-                time_for_move = movetime
-            elseif wtime and btime then
-                local my_time = (side == WHITE) and wtime or btime
-                local my_inc  = ((side == WHITE) and winc or binc) or 0
-                -- Allocate roughly time / 25 + inc
-                time_for_move = floor(my_time / 25 + my_inc * 0.8)
-                if time_for_move < 50 then time_for_move = 50 end
-                if time_for_move > my_time * 0.5 then time_for_move = floor(my_time * 0.5) end
+            local hard, soft
+            local my_time = (side == WHITE) and wtime or btime
+            if infinite then
+                hard, soft = nil, nil
+            elseif movetime then
+                hard = movetime
+                soft = movetime -- use the full budget; the hard limit stops mid-iteration
+            elseif my_time then
+                local my_inc = ((side == WHITE) and winc or binc) or 0
+                local mtg = movestogo or 30
+                if mtg < 1 then mtg = 1 end
+                local overhead = 30
+                soft = my_time / (mtg + 2) + my_inc * 0.75
+                hard = soft * 3
+                local cap = my_time * 0.4 - overhead
+                if hard > cap then hard = cap end
+                if hard < 10 then hard = 10 end
+                if soft > hard then soft = hard end
             end
 
-            search_position(depth, time_for_move)
+            if infinite and not input_available then
+                print("info string stop is unsupported without LuaJIT; searching to depth " .. min(depth, MAX_SEARCH_PLY - 1))
+            end
+            stop_poll = input_available and poll_input or nil
+            local best = search_position(depth, hard, soft, true)
+            stop_poll = nil
+            print("bestmove " .. move_to_uci(best))
 
         elseif cmd == "perft" then
             local d = tonumber(tokens[2]) or 1
@@ -1758,6 +1922,8 @@ Moonfish.make_move = make_move
 Moonfish.unmake_move = unmake_move
 Moonfish.uci_loop = uci_loop
 Moonfish.print_board = print_board
+Moonfish.clear_tt = clear_tt
+Moonfish.move_to_uci = move_to_uci
 
 -- Execute UCI loop if run directly from command line
 if pcall(debug.getlocal, 4, 1) == false then

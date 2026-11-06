@@ -1,101 +1,44 @@
 # Moonfish
 
-> A lightweight, high-performance chess engine in a single Lua 5.1 file.
+A lightweight UCI chess engine for Lua 5.1, contained in a single file.
 
-Moonfish is a self-contained, dependency-free chess engine designed for maximum efficiency in Lua 5.1 and LuaJIT environments. Engineered with zero-allocation data structures and state-of-the-art alpha-beta search heuristics, it delivers grandmaster-level tactical speed while remaining under 900 lines of clean, readable code.
+Moonfish runs on stock PUC-Lua 5.1 with no dependencies, and uses LuaJIT's `bit` and `ffi` libraries automatically when available for higher speed and responsive time control.
 
----
+## Features
 
-## Highlights
+- **Single file, no dependencies.** Drop `moonfish.lua` anywhere and run it.
+- **Allocation-free search.** Integer-packed moves, flat move stacks and make/unmake keep the garbage collector out of the hot path.
+- **10×12 mailbox board.** Sentinel squares replace bounds checks; no bitwise operations are required on plain Lua 5.1.
+- **Tapered PeSTO evaluation**, updated incrementally on every move.
+- **Search:** iterative deepening, principal variation search, transposition table, null-move pruning, late move reductions, check extensions, mate distance pruning, and quiescence search with delta pruning.
+- **Move ordering:** hash move, MVV-LVA, killer moves and history heuristic.
+- **Perft-tested** move generation against standard reference positions.
 
-- **Single-File Architecture**: Everything lives in `moonfish.lua` with zero external dependencies.
-- **Pure Lua 5.1 & LuaJIT Compatible**: Runs natively on standard PUC-Lua 5.1 (`lua.exe`) and unlocks over **1,000,000 nodes/sec** under LuaJIT.
-- **Zero-Allocation Search**: Move generation and search loop run without allocating heap tables, completely eliminating Lua garbage collection overhead.
-- **UCI Protocol Compliant**: Plug-and-play with Cutechess, Arena, Banksia GUI, and Lichess-bot.
-- **100% Perft Verified**: Formally verified against standard Perft suites (Startpos, Kiwipete, Positions 3–5).
+## Usage
 
----
-
-## Engine Architecture
-
-### Board Representation
-- **10×12 Mailbox (120 squares)**: Folded boundary and collision checks via array sentinels. Requires zero bitwise operations, maximizing speed across all Lua runtimes.
-- **Bit-Packed Moves**: Moves are encoded into compact integers containing source, destination, promotion piece, and special move flags.
-- **In-Place Undo Stack**: Board state changes are tracked through pre-allocated arrays, enabling immediate make/unmake operations without table copies.
-
-### Evaluation
-- **Tapered PeSTO Piece-Square Tables**: Seamless interpolation between Middlegame (MG) and Endgame (EG) tables based on non-pawn material phase.
-- **Incremental $O(1)$ Updates**: Material and positional scores update incrementally during moves. Leaf node evaluation requires zero board scanning loops.
-
-### Search & Heuristics
-- **Negamax $\alpha$-$\beta$** with Iterative Deepening
-- **Transposition Table**: 262,144 entries using hybrid Zobrist hashing (LuaJIT native bitwise operations with a precomputed byte-table fallback for vanilla Lua 5.1).
-- **Move Ordering**:
-  1. Transposition Table best move
-  2. MVV-LVA (Most Valuable Victim – Least Valuable Attacker)
-  3. Killer Moves (2 per ply)
-  4. History Heuristic for quiet moves
-  5. In-place selection sort (immediate break on beta cutoffs)
-- **Selectivity & Pruning**:
-  - Quiescence Search (QS) with Delta Pruning
-  - Null Move Pruning (NMP, $R=2/3$) with zugzwang safety check
-  - Late Move Reductions (LMR)
-  - Check Extensions (+1 ply on check)
-
----
-
-## Quickstart
-
-### Interactive / UCI Mode
-
-Launch Moonfish directly using LuaJIT or standard Lua:
-
-```bash
-luajit moonfish.lua
-# or
-lua moonfish.lua
+```sh
+luajit moonfish.lua   # recommended
+lua moonfish.lua      # plain Lua 5.1
 ```
 
-In standard UCI GUIs (e.g. Cutechess), register Moonfish by pointing the engine command to `luajit` (or `lua`) with argument `moonfish.lua`.
+To use it in a chess GUI such as Cute Chess or Arena, add a UCI engine with command `luajit` and argument `moonfish.lua`.
 
-### Built-in Commands
+Supported UCI commands: `uci`, `isready`, `ucinewgame`, `position`, `go` (`depth`, `movetime`, `wtime`/`btime`/`winc`/`binc`/`movestogo`, `infinite`), `stop`, `quit`.
 
-Moonfish supports standard UCI commands alongside interactive debugging tools:
+Debug commands: `d` (print board), `eval` (static evaluation), `perft <depth>`.
 
-```
-uci                                    Handshake and engine identifier
-isready                                Verifies readiness
-position startpos moves e2e4 e7e5 ...  Sets up board position
-go depth 6                             Searches to a fixed depth
-go movetime 1000                       Searches for 1 second
-perft 4                                Runs Perft move validation to depth 4
-d                                      Renders ASCII board and game state
-eval                                   Displays current static evaluation
-```
+> On plain Lua 5.1 there is no portable way to poll stdin, so `stop` is only read between searches. Use a depth or time limit there, or run under LuaJIT.
 
----
+## Testing
 
-## Testing & Benchmarks
-
-Run the Perft validation suite:
-```bash
-luajit test_suite.lua
-# or
-lua test_suite.lua
+```sh
+lua test_suite.lua     # perft
+lua test_tactics.lua   # tactical positions
+python match.py --b "pypy3 sunfish.py" --movetime 100 --games 100   # needs: pip install chess
 ```
 
-Run tactical puzzle benchmarks:
-```bash
-luajit test_tactics.lua
-```
-
-Run an automated match against Sunfish:
-```bash
-python match_arbiter.py 250
-```
-
----
+`match.py` plays any two UCI engines against each other from a set of openings, with colours reversed. Opponent engines are not bundled.
 
 ## License
 
-Moonfish is licensed under the [MIT License](LICENSE). Free for personal, academic, and commercial use.
+[MIT](LICENSE)
